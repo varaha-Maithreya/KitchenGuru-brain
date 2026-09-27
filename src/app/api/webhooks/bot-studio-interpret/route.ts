@@ -3,7 +3,7 @@ import { generateObject, generateText, tool, isStepCount } from 'ai';
 import { z } from 'zod';
 import { guruMcpTools } from '@/lib/mcpGuruClient';
 import { kitchenClient } from '@/lib/kitchen';
-import { llmConfigured, modelFor } from '@/lib/llm';
+import { backendSchema, explainLlmError, llmConfigured, modelFor, modelFromBackend } from '@/lib/llm';
 import { isInternalCaller } from '@/lib/tenant';
 
 /**
@@ -25,6 +25,11 @@ import { isInternalCaller } from '@/lib/tenant';
  * restaurant's menu. Without a locationId (older callers) there is no menu
  * to match against and no MCP lookup: the flow falls back to its
  * deterministic behaviour.
+ *
+ * The model is Guru's own unless the request carries an `llm` backend (the
+ * inbox account's own provider, model and key, set in Bot Studio). The
+ * 'ping' purpose makes one tiny call so the editor can test a backend
+ * before saving it.
  */
 
 type MenuEntry = { id: string; name: string; price: number };
@@ -60,20 +65,42 @@ export async function POST(req: Request) {
   if (!isInternalCaller(req)) return NextResponse.json({ handled: false }, { status: 401 });
   try {
     const body = await req.json();
-    const { purpose, prompt, options, text, variables, locationId } = body as {
-      purpose: 'choice' | 'capture';
+    const { purpose, prompt, options, text, variables, locationId, llm } = body as {
+      purpose: 'choice' | 'capture' | 'ping';
       prompt?: string;
       options?: { id: string; label: string }[];
       text: string;
       variables?: Record<string, string>;
       locationId?: string;
+      llm?: unknown;
     };
+
+    const backend = llm ? backendSchema.safeParse(llm) : null;
+    if (backend && !backend.success) {
+      const error = backend.error.issues[0]?.message || 'Invalid AI backend';
+      return purpose === 'ping'
+        ? NextResponse.json({ ok: false, error })
+        : NextResponse.json({ handled: false }, { status: 400 });
+    }
+    const model = backend ? modelFromBackend(backend.data) : modelFor('agent');
+
+    if (purpose === 'ping') {
+      if (!backend && !llmConfigured()) {
+        return NextResponse.json({ ok: false, error: 'Guru Brain has no Gemini API key configured.' });
+      }
+      const started = Date.now();
+      try {
+        await generateText({ model, prompt: 'Reply with the single word: ready', maxOutputTokens: 64, maxRetries: 0 });
+        return NextResponse.json({ ok: true, latencyMs: Date.now() - started });
+      } catch (err) {
+        console.warn('[Bot Studio Interpret] backend test failed:', err instanceof Error ? err.message.split('\n')[0] : err);
+        return NextResponse.json({ ok: false, error: explainLlmError(err) });
+      }
+    }
 
     if (!text || !purpose) {
       return NextResponse.json({ handled: false }, { status: 400 });
     }
-
-    const model = modelFor('agent');
 
     if (purpose === 'choice') {
       let finalAnswer: z.infer<typeof choiceSchema> | null = null;
