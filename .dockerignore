@@ -1,0 +1,10 @@
+# Keep secrets and local build output out of the image (the Dockerfile does `COPY . .`).
+# Runtime configuration comes from docker-compose environment variables.
+.env
+.env.*
+!.env.example
+node_modules
+.next
+.git
+*.tsbuildinfo
+npm-debug.log*
