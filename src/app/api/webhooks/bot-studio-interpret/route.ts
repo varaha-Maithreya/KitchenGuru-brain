@@ -1,10 +1,28 @@
 import { NextResponse } from 'next/server';
-import { generateObject, generateText, tool, isStepCount } from 'ai';
+import { generateObject, generateText, tool, isStepCount, type LanguageModel, type LanguageModelUsage } from 'ai';
 import { z } from 'zod';
 import { guruMcpTools } from '@/lib/mcpGuruClient';
 import { kitchenClient } from '@/lib/kitchen';
 import { backendSchema, explainLlmError, llmConfigured, modelFor, modelFromBackend } from '@/lib/llm';
 import { isInternalCaller } from '@/lib/tenant';
+
+/// Only worth reporting when the call actually ran on DeusCoreAI's own key
+/// (modelFor, i.e. no `backend` in the request) - Bot Studio's "bring your
+/// own key" accounts already pay their own provider directly for this
+/// usage, so it must never also debit DeusCoreAI credits. undefined (not a
+/// zeroed object) when BYOK, so the caller can tell "nothing to meter"
+/// apart from "metered zero tokens".
+function usageForMetering(isByok: boolean, model: LanguageModel, usage: LanguageModelUsage) {
+  if (isByok) return undefined;
+  // LanguageModel is a union (a resolved model instance, or a bare model-id
+  // string shortcut) - modelFor('agent') always returns the former today,
+  // but narrow rather than assume, same as this codebase's own llm.test.ts.
+  if (typeof model !== 'object') return undefined;
+  return {
+    model: { provider: model.provider, name: model.modelId },
+    usage: { inputTokens: usage.inputTokens ?? 0, outputTokens: usage.outputTokens ?? 0 },
+  };
+}
 
 /**
  * Bot Studio's own AI fallback — deliberately NOT the Guru persona.
@@ -105,7 +123,7 @@ export async function POST(req: Request) {
     if (purpose === 'choice') {
       let finalAnswer: z.infer<typeof choiceSchema> | null = null;
 
-      await generateText({
+      const choiceResult = await generateText({
         model,
         system: "The bot running the conversation asked the customer a button-choice question and their reply didn't match any button. Decide whether they meant one of the buttons, or asked something else entirely. If answering honestly needs real data (today's bestsellers, dietary/allergen info, current kitchen load), call the menu_insights or fulfillment_snapshot tool first — never guess at facts you can look up. When you've decided, call respond exactly once with your conclusion, then stop.",
         prompt: `The bot asked: "${prompt || ''}"\nAvailable options: ${(options || []).map((o) => `[${o.id}] ${o.label}`).join(', ')}\nThe customer replied: "${text}"`,
@@ -131,10 +149,11 @@ export async function POST(req: Request) {
           }),
         },
       });
+      const metering = usageForMetering(!!backend, model, choiceResult.totalUsage);
 
-      if (!finalAnswer) return NextResponse.json({ handled: false });
+      if (!finalAnswer) return NextResponse.json({ handled: false, ...metering });
       const answer: z.infer<typeof choiceSchema> = finalAnswer;
-      return NextResponse.json({ handled: true, matchedOptionId: answer.matchedOptionId || undefined, reply: answer.reply || undefined });
+      return NextResponse.json({ handled: true, matchedOptionId: answer.matchedOptionId || undefined, reply: answer.reply || undefined, ...metering });
     }
 
     // purpose === 'capture'
@@ -143,24 +162,25 @@ export async function POST(req: Request) {
     if (!menu.length) return NextResponse.json({ handled: false });
     const menuList = menu.map((m) => `[${m.id}] ${m.name} — ${m.price}`).join('\n');
 
-    const { object } = await generateObject({
+    const { object, usage } = await generateObject({
       model,
       schema: captureSchema,
       prompt: `Menu (id — name — price):\n${menuList}\n\nCurrent order context: ${JSON.stringify(variables || {})}\nThe customer said: "${text}"\n\nExtract the items and quantities they want, matched to REAL menu ids above only (never invent an id or guess one that isn't listed). If you can't confidently match at least one real item, return an empty items array and a short reply asking them to clarify (e.g. name the dish differently, or say it's not on the menu).`,
     });
+    const captureMetering = usageForMetering(!!backend, model, usage);
 
     if (!object.items.length) {
-      return NextResponse.json({ handled: false, reply: object.reply || "I couldn't find that on our menu — could you tell me the dish name again?" });
+      return NextResponse.json({ handled: false, reply: object.reply || "I couldn't find that on our menu — could you tell me the dish name again?", ...captureMetering });
     }
 
     const known = new Set(menu.map((m) => m.id));
     object.items = object.items.filter((i) => known.has(i.menuItemId));
     if (!object.items.length) {
-      return NextResponse.json({ handled: false, reply: "I couldn't find that on our menu — could you tell me the dish name again?" });
+      return NextResponse.json({ handled: false, reply: "I couldn't find that on our menu — could you tell me the dish name again?", ...captureMetering });
     }
 
     const value = JSON.stringify(object.items.map((i) => ({ menuItemId: i.menuItemId, name: i.name, quantity: i.quantity })));
-    return NextResponse.json({ handled: true, value });
+    return NextResponse.json({ handled: true, value, ...captureMetering });
   } catch (error: any) {
     console.error('[Bot Studio Interpret] failed:', error);
     return NextResponse.json({ handled: false }, { status: 500 });

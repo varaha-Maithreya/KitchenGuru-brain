@@ -34,5 +34,5 @@ export const POST = route(async (req: Request) => {
     message: String(body.message ?? ''),
     newConversation: !!body.newConversation,
   });
-  return ok({ conversationId: result.conversationId, reply: result.reply, toolCalls: result.toolCalls });
+  return ok({ conversationId: result.conversationId, reply: result.reply, toolCalls: result.toolCalls, usage: result.usage, model: result.model });
 });

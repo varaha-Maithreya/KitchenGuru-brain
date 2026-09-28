@@ -40,6 +40,12 @@ export interface TurnResult {
   reply: string;
   toolCalls: ToolCallRecord[];
   usage: { inputTokens: number; outputTokens: number };
+  /** The model that actually served this turn, read off the resolved
+   * LanguageModel instance rather than assumed - modelFor('agent') is
+   * always Gemini today (never the local fallback, unlike 'light' work),
+   * but the caller shouldn't have to know or duplicate that; it needs this
+   * to meter usage against the right rate card. */
+  model: { provider: string; name: string };
 }
 
 /**
@@ -72,8 +78,9 @@ export async function runTurn(input: TurnInput): Promise<TurnResult> {
       { role: 'user', content: message },
     ];
 
+    const resolvedModel = input.model ?? modelFor('agent');
     const result = await generateText({
-      model: input.model ?? modelFor('agent'),
+      model: resolvedModel,
       system,
       messages,
       tools,
@@ -92,6 +99,13 @@ export async function runTurn(input: TurnInput): Promise<TurnResult> {
       inputTokens: result.totalUsage?.inputTokens ?? 0,
       outputTokens: result.totalUsage?.outputTokens ?? 0,
     };
+    // LanguageModel is a union (resolved instance, or a bare model-id string
+    // shortcut) - modelFor('agent') always returns the former today, but
+    // narrow rather than assume, same as this codebase's own llm.test.ts.
+    const model =
+      typeof resolvedModel === 'object'
+        ? { provider: resolvedModel.provider, name: resolvedModel.modelId }
+        : { provider: 'unknown', name: resolvedModel };
 
     await appendMessages(tenant, conv.id, [
       { role: 'user', content: message },
@@ -108,7 +122,7 @@ export async function runTurn(input: TurnInput): Promise<TurnResult> {
       );
     }
 
-    return { conversationId: conv.id, title: conv.title ?? message.slice(0, 80), reply, toolCalls, usage };
+    return { conversationId: conv.id, title: conv.title ?? message.slice(0, 80), reply, toolCalls, usage, model };
   } finally {
     await releaseTurn(tenant, conv.id).catch(() => undefined);
     // Don't leave an empty conversation behind when its very first turn failed.
